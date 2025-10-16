@@ -141,8 +141,8 @@ def visualize_eval_preview(
 def main():
     parser = argparse.ArgumentParser(description="Preview flower data augmentations")
     parser.add_argument("--data", type=str, required=True,
-                        help="数据根目录（包含 train/val/test 子目录的 ImageFolder 结构）")
-    parser.add_argument("--split-train", type=str, default="train", help="训练集子目录名")
+                        help="数据根目录（包含 flowers_train_images/val/test 子目录的 ImageFolder 结构）")
+    parser.add_argument("--split-flowers_train_images", type=str, default="flowers_train_images", help="训练集子目录名")
     parser.add_argument("--split-eval", type=str, default="val", help="验证/测试子目录名（用于 eval 预览）")
     parser.add_argument("--img-size", type=int, default=288)
     parser.add_argument("--mean", type=str, default="0.485,0.456,0.406",

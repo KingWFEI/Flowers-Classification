@@ -7,7 +7,7 @@ from torchvision.datasets import ImageFolder
 from torch.utils.data import DataLoader
 import numpy as np
 
-root = "../data/flowers/flowers/train"  # 只用训练集
+root = "../data/flowers/flowers/flowers_train_images"  # 只用训练集
 img_size = 288
 tf = transforms.Compose([
     transforms.Resize(int(img_size*256/224)),

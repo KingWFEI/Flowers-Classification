@@ -15,18 +15,11 @@ from torchvision.models import resnet50, ResNet50_Weights
 from torchvision.transforms import InterpolationMode
 from tqdm import tqdm
 
-from loss.snapmix_loss import ce_with_snapmix
-from tools.register_last_conv import register_last_conv_hook
-from tools.build_transforms import build_transforms
-from tools.snap_mix import snapmix
-
-
-try:
-    import timm  # 可选
-    from timm.data import resolve_model_data_config, create_transform
-    HAS_TIMM = True
-except Exception:
-    HAS_TIMM = False
+from src.utils import build_dataloaders_from_csv
+from src.loss.snapmix_loss import ce_with_snapmix
+from model.FS_Net import FADCResNet
+from src.tools.register_last_conv import register_last_conv_hook
+from src.tools.snap_mix import snapmix
 
 
 def set_seed(seed: int = 42):
@@ -36,76 +29,164 @@ def set_seed(seed: int = 42):
     torch.backends.cudnn.benchmark = True  # 更快
     torch.backends.cudnn.deterministic = False
 
-# 构建训练迭代器
-def build_dataloaders(data_root: str,
-                      img_size: int,
-                      batch_size: int,
-                      workers: int,
-                      combine_train_val: bool = False
-                      ):
+# tools/build_datasets_csv.py
+import os, csv, random
+from pathlib import Path
+from typing import Dict, List, Tuple
+from PIL import Image
+
+import torch
+from torch.utils.data import Dataset, DataLoader
+
+
+
+class FlowerCsvDataset(Dataset):
     """
-    使用 ImageFolder 读取 train/val/test 三个子目录。
-    自动推断 num_classes，并返回 class_names（按 ImageFolder 的顺序）。
+    从 CSV 读取标注：
+      必须字段：filename, category
+      可选字段：chinese, english_name（仅用于记录类名，不影响训练）
+    图片目录：img_dir / filename
     """
-    # 默认 ImageNet 统计
-    mean, std = (0.485, 0.456, 0.406), (0.229, 0.224, 0.225)
+    def __init__(self, rows: List[Dict], img_dir: Path, transform=None):
+        self.rows = rows
+        self.img_dir = Path(img_dir)
+        self.transform = transform
 
-    # 1) 构造 transforms
-    train_tf, eval_tf = build_transforms(img_size=img_size, use_trivial_augment=True, mean=mean, std=std)
+    def __len__(self): return len(self.rows)
 
-    root = Path(data_root)
-    train_dir = root / "train"
-    val_dir   = root / "val"
-    test_dir  = root / "test"
+    def __getitem__(self, idx):
+        r = self.rows[idx]
+        path = self.img_dir / r["filename"]
+        # 保险处理：部分 CSV 可能不带扩展名，这里尝试常见后缀
+        if not path.is_file():
+            for ext in [".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff", ".JPG", ".PNG"]:
+                if (self.img_dir / (r["filename"] + ext)).is_file():
+                    path = self.img_dir / (r["filename"] + ext)
+                    break
+        img = Image.open(path).convert("RGB")
+        target = int(r["category_idx"])  # 已在构建时映射成 [0..C-1]
+        if self.transform: img = self.transform(img)
+        return img, target
 
-    print(train_dir)
-    assert train_dir.is_dir(), f"未找到 {train_dir}"
-    # val/test 可选，但建议都提供
-    if not val_dir.is_dir():
-        print(f"[WARN] 未找到 {val_dir}，将不在验证集上评估。")
-    if not test_dir.is_dir():
-        print(f"[WARN] 未找到 {test_dir}，将跳过最终测试评估。")
 
-    # 2) 构造数据集
-    ds_train = ImageFolder(str(train_dir), transform=train_tf)
-    class_names = ds_train.classes
-    num_classes = len(class_names)
+def _read_csv(csv_path: Path) -> List[Dict]:
+    """
+    读取 CSV，兼容带中文列名：filename, category, chinese, english_name
+    """
+    csv_path = Path(csv_path)
+    rows = []
+    with open(csv_path, "r", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        # 字段名容错（用户截图里的列名示例）
+        # 允许：category, label, class_id
+        for row in reader:
+            # 统一键名
+            filename = row.get("filename") or row.get("image") or row.get("file") or row.get("name")
+            category = row.get("category") or row.get("label") or row.get("class_id")
+            chinese  = row.get("chinese") or row.get("chinese_name") or row.get("category_chinese") or ""
+            english  = row.get("english_name") or row.get("category_english_name") or ""
+            if filename is None or category is None:
+                raise ValueError(f"CSV 缺少 filename 或 category 字段：{row}")
+            rows.append({
+                "filename": filename.strip(),
+                "category_raw": str(category).strip(),
+                "chinese": chinese,
+                "english_name": english,
+            })
+    if len(rows) == 0:
+        raise RuntimeError(f"CSV 为空：{csv_path}")
+    return rows
 
-    # 可选：把类名顺序保存下来，便于复现实验
-    (root / "class_names.json").write_text(json.dumps(class_names, indent=2, ensure_ascii=False), encoding="utf-8")
 
-    ds_val  = ImageFolder(str(val_dir),  transform=eval_tf)  if val_dir.is_dir()  else None
-    ds_test = ImageFolder(str(test_dir), transform=eval_tf)  if test_dir.is_dir() else None
+def _build_label_mapping(rows: List[Dict]) -> Tuple[Dict[str, int], List[str]]:
+    """
+    把 CSV 里的原始类别（可能是字符串/非连续数字）映射到 [0..C-1]
+    class_names：优先用 “中文+英文” 拼接；若没有就用原 category
+    """
+    cats = []
+    for r in rows:
+        cats.append(r["category_raw"])
+    uniq = sorted(set(cats), key=lambda x: (str(x)))
+    cat2idx = {c: i for i, c in enumerate(uniq)}
 
-    # 3) 是否合并 train+val（你已有 val，通常不合并）
-    if combine_train_val and ds_val is not None:
-        from torch.utils.data import ConcatDataset
-        ds_train = ConcatDataset([ds_train, ImageFolder(str(val_dir), transform=train_tf)])
-        ds_val = None
+    # 生成类名列表
+    class_names: List[str] = []
+    for c in uniq:
+        # 找到该类的第一条，用中文/英文组成名称
+        sample = next(r for r in rows if r["category_raw"] == c)
+        zh = (sample.get("chinese") or "").strip()
+        en = (sample.get("english_name") or "").strip()
+        if zh or en:
+            name = f"{zh} {en}".strip()
+        else:
+            name = str(c)
+        class_names.append(name)
 
-    # 4) DataLoader
-    train_loader = DataLoader(ds_train, batch_size=batch_size, shuffle=True,
-                              num_workers=workers, pin_memory=True, persistent_workers=workers > 0)
-    val_loader = DataLoader(ds_val, batch_size=batch_size, shuffle=False,
-                            num_workers=workers, pin_memory=True, persistent_workers=workers > 0) if ds_val else None
-    test_loader = DataLoader(ds_test, batch_size=batch_size, shuffle=False,
-                             num_workers=workers, pin_memory=True, persistent_workers=workers > 0) if ds_test else None
+    # 写回 idx
+    for r in rows:
+        r["category_idx"] = cat2idx[r["category_raw"]]
+    return cat2idx, class_names
 
-    return train_loader, val_loader, test_loader, num_classes, class_names
+
+def _stratified_split(rows: List[Dict], val_ratio: float, seed: int) -> Tuple[List[Dict], List[Dict]]:
+    """
+    简易分层抽样：各类别按比例划分到 flowers_train_images/val
+    """
+    rng = random.Random(seed)
+    by_class: Dict[int, List[Dict]] = {}
+    for r in rows:
+        by_class.setdefault(r["category_idx"], []).append(r)
+
+    train_rows, val_rows = [], []
+    for cls, items in by_class.items():
+        rng.shuffle(items)
+        n = len(items)
+        k = max(1, int(round(n * val_ratio)))  # 每类至少 1 张进 val（若 n 很小）
+        val_rows.extend(items[:k])
+        train_rows.extend(items[k:])
+    return train_rows, val_rows
+
+
+def json_dumps(obj) -> str:
+    import json
+    return json.dumps(obj, indent=2, ensure_ascii=False)
+
+
 
 # 从预训练模型构建自己的模型
-def build_model(num_classes=102, timm_model_name: str = None):
-    if timm_model_name:
-        assert HAS_TIMM, "请先 pip install timm"
-        model = timm.create_model(timm_model_name, pretrained=True, num_classes=num_classes)
-        return model
+def build_model(num_classes=102,use_fadc=False,pretrained=True):
 
-    # torchvision resnet50 + ImageNet1K 预训练
-    weights = ResNet50_Weights.IMAGENET1K_V2
-    model = resnet50(weights=weights)
-    in_f = model.fc.in_features
-    model.fc = nn.Linear(in_f, num_classes)
-    return model
+    # # torchvision resnet50 + ImageNet1K 预训练
+    # weights = ResNet50_Weights.IMAGENET1K_V2
+    # model = resnet50(weights=weights)
+    # in_f = model.fc.in_features
+    # model.fc = nn.Linear(in_f, num_classes)
+    # return model
+
+    if use_fadc:
+        # FADCResNet50
+        model = FADCResNet(num_classes=num_classes)
+        if pretrained:
+            from torchvision.models import resnet50, ResNet50_Weights
+            print("Loading torchvision resnet50 pretrained weights...")
+            tv = resnet50(weights=ResNet50_Weights.IMAGENET1K_V2)
+            tv_state = tv.state_dict()
+            model_state = model.state_dict()
+            transferred = 0
+            for k, v in tv_state.items():
+                if k in model_state and model_state[k].shape == v.shape:
+                    model_state[k].copy_(v)
+                    transferred += 1
+            model.load_state_dict(model_state)
+            print(f"Transferred {transferred} tensors from torchvision pretrained resnet50.")
+        return model
+    else:
+        from torchvision.models import resnet50, ResNet50_Weights
+        weights = ResNet50_Weights.IMAGENET1K_V2 if pretrained else None
+        model = resnet50(weights=weights)
+        in_f = model.fc.in_features
+        model.fc = nn.Linear(in_f, num_classes)
+        return model
 
 
 @torch.no_grad()
@@ -116,10 +197,9 @@ def evaluate(model, loader, device, amp=False, desc="Eval"):
     loss_sum = 0.0
     criterion = nn.CrossEntropyLoss()
     pbar = tqdm(loader, desc=desc, leave=False) if loader is not None else []
-    scaler_ctx = torch.cuda.amp.autocast if (amp and device.type == "cuda") else torch.cpu.amp.autocast
     for batch in pbar:
         images, targets = batch[0].to(device, non_blocking=True), batch[1].to(device, non_blocking=True)
-        with scaler_ctx():
+        with torch.amp.autocast(device_type="cuda", enabled=(amp and device.type == "cuda")):
             logits = model(images)
             loss = criterion(logits, targets)
         loss_sum += loss.item() * targets.size(0)
@@ -187,7 +267,7 @@ def save_checkpoint(state, out_dir: str, is_best=False, filename="last.pth"):
 
 def main():
     parser = argparse.ArgumentParser(description="Flowers102 Training (ResNet50 + TrivialAugment)")
-    parser.add_argument("--data", type=str, required=True, help="数据目录（会自动下载到该目录）")
+    # parser.add_argument("--data", type=str, required=True, help="数据目录（会自动下载到该目录）")
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=5e-4)
@@ -201,11 +281,10 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output", type=str, default="./checkpoints_flowers102")
     parser.add_argument("--no-trainval", action="store_true",
-                        help="不合并 train+val；每轮在 val 上评估（更慢）")
+                        help="不合并 flowers_train_images+val；每轮在 val 上评估（更慢）")
     parser.add_argument("--freeze-epochs", type=int, default=0,
                         help="前若干轮只训练分类头（冷启动更稳）")
-    parser.add_argument("--timm-model", type=str, default=None,
-                        help="可选：使用 timm 模型名（如 resnetv2_50x1_bit.goog_in21k）")
+    parser.add_argument("--use-fadc", action="store_true", help="使用 FADC-ResNet50 架构（频域增强模块）")
     parser.add_argument("--use-timm-transforms", action="store_true",
                         help="若指定，将按 timm 的数据配置与 ta_wide 增广构造 transforms")
     args = parser.parse_args()
@@ -215,16 +294,19 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    train_loader, val_loader, test_loader, num_classes, class_names = build_dataloaders(
-        data_root=args.data,
+    train_loader, val_loader, test_loader, num_classes, class_names = build_dataloaders_from_csv(
+        data_root="data/flowers_train_images",
+        csv_path="train_labels.csv",
+        img_subdir="train_images",
         img_size=args.img_size,
         batch_size=args.batch_size,
         workers=args.workers,
-        combine_train_val=False
+        val_ratio=0.1,  # 从训练集中划 10% 做验证
+        seed=args.seed
     )
     print(f"Found {num_classes} classes: {class_names[:5]}{' ...' if len(class_names) > 5 else ''}")
 
-    model = build_model(num_classes=102, timm_model_name=args.timm_model)
+    model = build_model(num_classes=102,use_fadc=args.use_fadc, pretrained=True)
     # 用 forward hook 抓取最后一个卷积特征图
     register_last_conv_hook(model)
 
@@ -277,7 +359,7 @@ def main():
         train_loss = train_one_epoch(model, train_loader,cls_head, optimizer, device, scaler, criterion,
                                      amp=args.amp, grad_clip=args.grad_clip)
 
-        # 验证（若不合并 train+val）
+        # 验证（若不合并 flowers_train_images+val）
         if val_loader is not None:
             val_acc, val_loss = evaluate(model, val_loader, device, amp=args.amp, desc="Val")
             print(f"Val  acc: {val_acc:.2f}%  loss: {val_loss:.4f}")
@@ -298,22 +380,6 @@ def main():
             "train_loss": float(train_loss),
             "val_acc": float(val_acc) if val_loader is not None else None
         })
-
-    # 测试集评估（使用 best.pth 如存在）
-    ckpt_best = os.path.join(args.output, "best.pth")
-    if os.path.exists(ckpt_best):
-        print(f"Load best checkpoint: {ckpt_best}")
-        state = torch.load(ckpt_best, map_location=device)
-        model.load_state_dict(state["state_dict"])
-
-    test_acc, test_loss = evaluate(model, test_loader, device, amp=args.amp, desc="Test")
-    print(f"\n==== Final Test ====\nTop-1 acc: {test_acc:.2f}%   loss: {test_loss:.4f}")
-
-    # 保存训练日志
-    with open(os.path.join(args.output, "train_log.json"), "w", encoding="utf-8") as f:
-        json.dump({"args": vars(args), "history": history,
-                   "final_test_acc": float(test_acc), "final_test_loss": float(test_loss)}, f, indent=2, ensure_ascii=False)
-
 
 if __name__ == "__main__":
     main()
