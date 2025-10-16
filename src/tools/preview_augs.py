@@ -12,7 +12,7 @@ from torchvision.transforms import InterpolationMode
 from torchvision.datasets import ImageFolder
 from torchvision.utils import make_grid, save_image
 
-from build_transforms import build_transforms
+from src.utils import build_transforms
 
 try:
     import matplotlib.pyplot as plt

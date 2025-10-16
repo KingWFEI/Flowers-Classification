@@ -1,26 +1,26 @@
-"""
-此代码用于计算图像数据集的均值和标准差，用于图像预处理中的归一化步骤。
-"""
-import torch, torchvision as tv
-from torchvision import transforms
-from torchvision.datasets import ImageFolder
-from torch.utils.data import DataLoader
-import numpy as np
+import torch
 
-root = "../data/flowers/flowers/flowers_train_images"  # 只用训练集
+from utils import _read_csv, _build_label_mapping, FlowerCsvDataset
+from pathlib import Path
+from torch.utils.data import DataLoader
+from torchvision import transforms
+
 img_size = 288
 tf = transforms.Compose([
     transforms.Resize(int(img_size*256/224)),
     transforms.CenterCrop(img_size),
-    transforms.ToTensor(),  # 注意：统计时不要先 Normalize
+    transforms.ToTensor(),    # 不要 Normalize、不要颜色增强
 ])
 
-ds = ImageFolder(root, transform=tf)
+root = Path("../data/flowers_train_images")
+rows = _read_csv(root / "train_labels.csv")
+_ , _ = _build_label_mapping(rows)  # 给每行写入 category_idx
+ds = FlowerCsvDataset(rows, img_dir=root / "train_images", transform=tf)
 loader = DataLoader(ds, batch_size=64, num_workers=0, shuffle=False)
 
 n = 0
 mean = torch.zeros(3)
-M2 = torch.zeros(3)  # online variance helper
+M2 = torch.zeros(3)
 for imgs, _ in loader:
     b = imgs.size(0)
     n_new = n + b

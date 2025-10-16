@@ -1,25 +1,18 @@
 import argparse
-import json
-import os
-import random
-from pathlib import Path
-from typing import Tuple
-
 import torch
+from torch.utils.data import Dataset
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, ConcatDataset
-from torchvision import transforms
-from torchvision.datasets import Flowers102, ImageFolder
-from torchvision.models import resnet50, ResNet50_Weights
-from torchvision.transforms import InterpolationMode
 from tqdm import tqdm
-
-from src.utils import build_dataloaders_from_csv
-from src.loss.snapmix_loss import ce_with_snapmix
-from model.FS_Net import FADCResNet
-from src.tools.register_last_conv import register_last_conv_hook
-from src.tools.snap_mix import snapmix
+from utils import build_dataloaders_from_csv
+from model import FADCResNet
+from utils import register_last_conv_hook
+from utils import snapmix
+import os, csv, random
+from pathlib import Path
+from typing import Dict, List, Tuple
+from PIL import Image
+from tools.vis_metrics import save_history_json, plot_curves, eval_confusion, try_tensorboard_writer, tb_log_scalars
 
 
 def set_seed(seed: int = 42):
@@ -28,17 +21,6 @@ def set_seed(seed: int = 42):
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.benchmark = True  # 更快
     torch.backends.cudnn.deterministic = False
-
-# tools/build_datasets_csv.py
-import os, csv, random
-from pathlib import Path
-from typing import Dict, List, Tuple
-from PIL import Image
-
-import torch
-from torch.utils.data import Dataset, DataLoader
-
-
 
 class FlowerCsvDataset(Dataset):
     """
@@ -151,17 +133,27 @@ def json_dumps(obj) -> str:
     import json
     return json.dumps(obj, indent=2, ensure_ascii=False)
 
-
+# 损失函数
+def ce_with_snapmix(logits: torch.Tensor, target_pack, base_ce):
+    """
+    target_pack: (y1, y2, lam_i, lam_j) 或 None
+    base_ce: nn.CrossEntropyLoss(label_smoothing=...)
+    """
+    y1, y2, lam_i, lam_j = target_pack
+    loss1 = base_ce(logits, y1)
+    loss2 = base_ce(logits, y2)
+    # 注意 lam_i/lam_j 逐样本；把它们扩展到 batch
+    # CrossEntropyLoss 已做了 batch 归一，这里做逐样本权重需要使用 reduction='none'
+    if getattr(base_ce, 'reduction', 'mean') != 'none':
+        # 重新实例化一个 none 版
+        base_ce_none = torch.nn.CrossEntropyLoss(label_smoothing=getattr(base_ce, 'label_smoothing', 0.0), reduction='none')
+        loss1 = base_ce_none(logits, y1)
+        loss2 = base_ce_none(logits, y2)
+    loss = (lam_i * loss1 + lam_j * loss2).mean()
+    return loss
 
 # 从预训练模型构建自己的模型
 def build_model(num_classes=102,use_fadc=False,pretrained=True):
-
-    # # torchvision resnet50 + ImageNet1K 预训练
-    # weights = ResNet50_Weights.IMAGENET1K_V2
-    # model = resnet50(weights=weights)
-    # in_f = model.fc.in_features
-    # model.fc = nn.Linear(in_f, num_classes)
-    # return model
 
     if use_fadc:
         # FADCResNet50
@@ -213,8 +205,7 @@ def evaluate(model, loader, device, amp=False, desc="Eval"):
 
 def train_one_epoch(model, loader, cls_head,optimizer, device, scaler, criterion, amp=False, grad_clip=None):
     model.train()
-    loss_sum = 0.0
-    total = 0
+    loss_sum, total, correct = 0.0, 0, 0
     pbar = tqdm(loader, desc="Train", leave=False)
 
     for images, targets in pbar:
@@ -234,8 +225,10 @@ def train_one_epoch(model, loader, cls_head,optimizer, device, scaler, criterion
             logits = model(images_sm)
             if tag is not None:
                 loss = ce_with_snapmix(logits, target_pack, base_ce=criterion)
+                preds = logits.argmax(dim=1)
             else:
                 loss = criterion(logits, targets)
+                preds = logits.argmax(dim=1)
         if amp and device.type == "cuda":
             scaler.scale(loss).backward()
             if grad_clip is not None:
@@ -251,12 +244,14 @@ def train_one_epoch(model, loader, cls_head,optimizer, device, scaler, criterion
 
         bs = targets.size(0)
         loss_sum += loss.item() * bs
+        correct += (preds == targets).sum().item()
         total += bs
-        pbar.set_postfix({"loss": f"{loss_sum/total:.4f}"})
+        pbar.set_postfix({"loss": f"{loss_sum / total:.4f}", "acc(%)": f"{100.0 * correct / max(total, 1):.2f}"})
+    train_loss = loss_sum / max(total, 1)
+    train_acc  = 100.0 * correct / max(total, 1)
+    return train_loss, train_acc
 
-    return loss_sum / max(total, 1)
-
-
+# 保存最佳模型
 def save_checkpoint(state, out_dir: str, is_best=False, filename="last.pth"):
     Path(out_dir).mkdir(parents=True, exist_ok=True)
     path = os.path.join(out_dir, filename)
@@ -280,13 +275,9 @@ def main():
     parser.add_argument("--grad-clip", type=float, default=None)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output", type=str, default="./checkpoints_flowers102")
-    parser.add_argument("--no-trainval", action="store_true",
-                        help="不合并 flowers_train_images+val；每轮在 val 上评估（更慢）")
     parser.add_argument("--freeze-epochs", type=int, default=0,
                         help="前若干轮只训练分类头（冷启动更稳）")
     parser.add_argument("--use-fadc", action="store_true", help="使用 FADC-ResNet50 架构（频域增强模块）")
-    parser.add_argument("--use-timm-transforms", action="store_true",
-                        help="若指定，将按 timm 的数据配置与 ta_wide 增广构造 transforms")
     args = parser.parse_args()
 
     set_seed(args.seed)
@@ -343,6 +334,7 @@ def main():
     criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
 
     best_acc = 0.0
+    writer = try_tensorboard_writer(args.output)
     history = []
 
     # 开始训练
@@ -356,30 +348,39 @@ def main():
             scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, args.epochs - epoch - 1))
 
         print(f"\nEpoch [{epoch+1}/{args.epochs}]  lr={optimizer.param_groups[0]['lr']:.6f}")
-        train_loss = train_one_epoch(model, train_loader,cls_head, optimizer, device, scaler, criterion,
+        train_loss,train_acc  = train_one_epoch(model, train_loader,cls_head, optimizer, device, scaler, criterion,
                                      amp=args.amp, grad_clip=args.grad_clip)
 
-        # 验证（若不合并 flowers_train_images+val）
-        if val_loader is not None:
-            val_acc, val_loss = evaluate(model, val_loader, device, amp=args.amp, desc="Val")
-            print(f"Val  acc: {val_acc:.2f}%  loss: {val_loss:.4f}")
-            is_best = val_acc > best_acc
-            if is_best:
-                best_acc = val_acc
-                save_checkpoint({"epoch": epoch + 1, "state_dict": model.state_dict()}, args.output, is_best=True)
-        else:
-            # 仅记录训练损失
-            is_best = False
+        # 验证
+        val_acc, val_loss = evaluate(model, val_loader, device, amp=args.amp, desc="Val")
+        print(f"Val  acc: {val_acc:.2f}%  loss: {val_loss:.4f}")
+        is_best = val_acc > best_acc
+        if is_best:
+            best_acc = val_acc
+            save_checkpoint({"epoch": epoch + 1, "state_dict": model.state_dict()}, args.output, is_best=True)
 
         save_checkpoint({"epoch": epoch + 1, "state_dict": model.state_dict()}, args.output, is_best=False)
         scheduler.step()
 
-        history.append({
+        rec = {
             "epoch": epoch + 1,
-            "lr": optimizer.param_groups[0]['lr'],
+            "lr": float(optimizer.param_groups[0]['lr']),
             "train_loss": float(train_loss),
-            "val_acc": float(val_acc) if val_loader is not None else None
-        })
+            "train_acc": float(train_acc),
+            "val_loss": float(val_loss),
+            "val_acc": float(val_acc)
+        }
+        history.append(rec)
+        # 保存/绘图/TensorBoard
+        save_history_json(history, args.output)
+        plot_curves(history, args.output)
+        tb_log_scalars(writer, rec)
+
+    eval_confusion(model, val_loader, device, class_names, out_dir=args.output, amp=args.amp)
+    print(f"可视化结果已保存到：{args.output}\n"
+          f"- loss_curves.png / acc_curves.png / lr_curve.png\n"
+          f"- confusion_matrix.png / per_class_acc.png / class_report.txt\n"
+          f"- history.json")
 
 if __name__ == "__main__":
     main()
