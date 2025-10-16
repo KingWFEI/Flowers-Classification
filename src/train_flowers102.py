@@ -1,4 +1,3 @@
-
 import argparse
 import json
 import os
@@ -16,12 +15,11 @@ from torchvision.models import resnet50, ResNet50_Weights
 from torchvision.transforms import InterpolationMode
 from tqdm import tqdm
 
-try:
-    import timm  # 可选
-    from timm.data import resolve_model_data_config, create_transform
-    HAS_TIMM = True
-except Exception:
-    HAS_TIMM = False
+from loss.snapmix_loss import ce_with_snapmix
+from model.FS_Net import FADCResNet
+from tools.register_last_conv import register_last_conv_hook
+from tools.build_transforms import build_transforms
+from tools.snap_mix import snapmix
 
 
 def set_seed(seed: int = 42):
@@ -31,60 +29,26 @@ def set_seed(seed: int = 42):
     torch.backends.cudnn.benchmark = True  # 更快
     torch.backends.cudnn.deterministic = False
 
-
-def build_transforms(img_size: int = 224,
-                     use_trivial_augment: bool = True,
-                     mean=(0.485, 0.456, 0.406),
-                     std=(0.229, 0.224, 0.225)) -> Tuple[transforms.Compose, transforms.Compose]:
-    """Torchvision 增广：RandomResizedCrop + TrivialAugmentWide + RandomErasing"""
-    train_tf = [
-        transforms.RandomResizedCrop(img_size, scale=(0.7, 1.0), interpolation=InterpolationMode.BICUBIC),
-        transforms.RandomHorizontalFlip(p=0.5),
-    ]
-    if use_trivial_augment:
-        train_tf.append(transforms.TrivialAugmentWide(interpolation=InterpolationMode.BICUBIC))
-    train_tf += [
-        transforms.ToTensor(),
-        transforms.Normalize(mean=mean, std=std),
-        transforms.RandomErasing(p=0.25, scale=(0.02, 0.2), ratio=(0.3, 3.3), value='random'),
-    ]
-    train_tf = transforms.Compose(train_tf)
-
-    eval_tf = transforms.Compose([
-        transforms.Resize(int(img_size * 256 / 224), interpolation=InterpolationMode.BICUBIC),
-        transforms.CenterCrop(img_size),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=mean, std=std),
-    ])
-    return train_tf, eval_tf
-
 # 构建训练迭代器
 def build_dataloaders(data_root: str,
                       img_size: int,
                       batch_size: int,
                       workers: int,
-                      combine_train_val: bool = False,   # 对于你已有 split，默认不合并
-                      use_timm_transforms: bool = False,
-                      timm_model_name: str = None):
+                      combine_train_val: bool = False
+                      ):
     """
-    使用 ImageFolder 读取 train/val/test 三个子目录。
+    使用 ImageFolder 读取 flowers_train_images/val/test 三个子目录。
     自动推断 num_classes，并返回 class_names（按 ImageFolder 的顺序）。
     """
     # 默认 ImageNet 统计
     mean, std = (0.485, 0.456, 0.406), (0.229, 0.224, 0.225)
 
-    # 1) 构造 transforms（优先用我们定义的，避免 timm 版本差异）
-    if use_timm_transforms and timm_model_name and HAS_TIMM:
-        _tmp = timm.create_model(timm_model_name, pretrained=True, num_classes=1000)
-        data_cfg = resolve_model_data_config(_tmp)
-        train_tf = create_transform(input_size=data_cfg['input_size'], is_training=True, auto_augment=None)
-        eval_tf  = create_transform(input_size=data_cfg['input_size'], is_training=False)
-    else:
-        train_tf, eval_tf = build_transforms(img_size=img_size, use_trivial_augment=True, mean=mean, std=std)
+    # 1) 构造 transforms
+    train_tf, eval_tf = build_transforms(img_size=img_size, use_trivial_augment=True, mean=mean, std=std)
 
     root = Path(data_root)
-    train_dir = root / "train"
-    val_dir   = root / "valid"
+    train_dir = root / "flowers_train_images"
+    val_dir   = root / "val"
     test_dir  = root / "test"
 
     print(train_dir)
@@ -106,7 +70,7 @@ def build_dataloaders(data_root: str,
     ds_val  = ImageFolder(str(val_dir),  transform=eval_tf)  if val_dir.is_dir()  else None
     ds_test = ImageFolder(str(test_dir), transform=eval_tf)  if test_dir.is_dir() else None
 
-    # 3) 是否合并 train+val（你已有 val，通常不合并）
+    # 3) 是否合并 flowers_train_images+val（你已有 val，通常不合并）
     if combine_train_val and ds_val is not None:
         from torch.utils.data import ConcatDataset
         ds_train = ConcatDataset([ds_train, ImageFolder(str(val_dir), transform=train_tf)])
@@ -123,18 +87,39 @@ def build_dataloaders(data_root: str,
     return train_loader, val_loader, test_loader, num_classes, class_names
 
 # 从预训练模型构建自己的模型
-def build_model(num_classes=102, timm_model_name: str = None):
-    if timm_model_name:
-        assert HAS_TIMM, "请先 pip install timm"
-        model = timm.create_model(timm_model_name, pretrained=True, num_classes=num_classes)
-        return model
+def build_model(num_classes=102,use_fadc=False,pretrained=True):
 
-    # torchvision resnet50 + ImageNet1K 预训练
-    weights = ResNet50_Weights.IMAGENET1K_V2
-    model = resnet50(weights=weights)
-    in_f = model.fc.in_features
-    model.fc = nn.Linear(in_f, num_classes)
-    return model
+    # # torchvision resnet50 + ImageNet1K 预训练
+    # weights = ResNet50_Weights.IMAGENET1K_V2
+    # model = resnet50(weights=weights)
+    # in_f = model.fc.in_features
+    # model.fc = nn.Linear(in_f, num_classes)
+    # return model
+
+    if use_fadc:
+        # FADCResNet50
+        model = FADCResNet(num_classes=num_classes)
+        if pretrained:
+            from torchvision.models import resnet50, ResNet50_Weights
+            print("Loading torchvision resnet50 pretrained weights...")
+            tv = resnet50(weights=ResNet50_Weights.IMAGENET1K_V2)
+            tv_state = tv.state_dict()
+            model_state = model.state_dict()
+            transferred = 0
+            for k, v in tv_state.items():
+                if k in model_state and model_state[k].shape == v.shape:
+                    model_state[k].copy_(v)
+                    transferred += 1
+            model.load_state_dict(model_state)
+            print(f"Transferred {transferred} tensors from torchvision pretrained resnet50.")
+        return model
+    else:
+        from torchvision.models import resnet50, ResNet50_Weights
+        weights = ResNet50_Weights.IMAGENET1K_V2 if pretrained else None
+        model = resnet50(weights=weights)
+        in_f = model.fc.in_features
+        model.fc = nn.Linear(in_f, num_classes)
+        return model
 
 
 @torch.no_grad()
@@ -160,22 +145,31 @@ def evaluate(model, loader, device, amp=False, desc="Eval"):
     return correct / total * 100.0, loss_sum / total
 
 
-def train_one_epoch(model, loader, optimizer, device, scaler, criterion, amp=False, grad_clip=None):
+def train_one_epoch(model, loader, cls_head,optimizer, device, scaler, criterion, amp=False, grad_clip=None):
     model.train()
     loss_sum = 0.0
     total = 0
     pbar = tqdm(loader, desc="Train", leave=False)
-    scaler_ctx = torch.cuda.amp.autocast if (amp and device.type == "cuda") else torch.cpu.amp.autocast
 
     for images, targets in pbar:
         images = images.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
 
-        optimizer.zero_grad(set_to_none=True)
-        with scaler_ctx():
-            logits = model(images)
-            loss = criterion(logits, targets)
+        # 先默认不启用 SnapMix
+        target_pack = None
+        # 以 0.5 概率启用 SnapMix
+        images_sm, target_pack, tag = snapmix(images, targets, model, cls_head, alpha=5.0, prob=0.5)
 
+        optimizer.zero_grad(set_to_none=True)
+
+
+
+        with torch.amp.autocast(device_type="cuda", enabled=amp):
+            logits = model(images_sm)
+            if tag is not None:
+                loss = ce_with_snapmix(logits, target_pack, base_ce=criterion)
+            else:
+                loss = criterion(logits, targets)
         if amp and device.type == "cuda":
             scaler.scale(loss).backward()
             if grad_clip is not None:
@@ -221,11 +215,10 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output", type=str, default="./checkpoints_flowers102")
     parser.add_argument("--no-trainval", action="store_true",
-                        help="不合并 train+val；每轮在 val 上评估（更慢）")
+                        help="不合并 flowers_train_images+val；每轮在 val 上评估（更慢）")
     parser.add_argument("--freeze-epochs", type=int, default=0,
                         help="前若干轮只训练分类头（冷启动更稳）")
-    parser.add_argument("--timm-model", type=str, default=None,
-                        help="可选：使用 timm 模型名（如 resnetv2_50x1_bit.goog_in21k）")
+    parser.add_argument("--use-fadc", action="store_true", help="使用 FADC-ResNet50 架构（频域增强模块）")
     parser.add_argument("--use-timm-transforms", action="store_true",
                         help="若指定，将按 timm 的数据配置与 ta_wide 增广构造 transforms")
     args = parser.parse_args()
@@ -240,13 +233,17 @@ def main():
         img_size=args.img_size,
         batch_size=args.batch_size,
         workers=args.workers,
-        combine_train_val=False,  # 你已有 val，保持 False
-        use_timm_transforms=args.use_timm_transforms,
-        timm_model_name=args.timm_model,
+        combine_train_val=False
     )
     print(f"Found {num_classes} classes: {class_names[:5]}{' ...' if len(class_names) > 5 else ''}")
 
-    model = build_model(num_classes=102, timm_model_name=args.timm_model)
+    model = build_model(num_classes=102,use_fadc=args.use_fadc, pretrained=True)
+    # 用 forward hook 抓取最后一个卷积特征图
+    register_last_conv_hook(model)
+
+    # 把分类头拿出来传给 snapmix（一般是 model.fc 或 model.classifier）
+    cls_head = model.module.fc if isinstance(model, torch.nn.DataParallel) else model.fc
+    print('分类头：', cls_head)
     if torch.cuda.device_count() > 1:
         print(f"Using DataParallel with {torch.cuda.device_count()} GPUs")
         model = nn.DataParallel(model)
@@ -273,12 +270,13 @@ def main():
         return 0.5 * (1.0 + (1.0 - progress) * -1.0 + 1.0)  # 等价于 cosine 简化，稳妥起见直接返回 1 -> 0
     # 更直接的余弦：可替换为 torch.optim.lr_scheduler.CosineAnnealingLR
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, args.epochs - args.warmup_epochs))
-    scaler = torch.cuda.amp.GradScaler(enabled=args.amp and device.type == "cuda")
+    scaler = torch.amp.GradScaler(device="cuda", enabled=(args.amp and device.type == "cuda"))
     criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
 
     best_acc = 0.0
     history = []
 
+    # 开始训练
     for epoch in range(args.epochs):
         if epoch == args.freeze_epochs and args.freeze_epochs > 0:
             # 解除冻结
@@ -289,10 +287,10 @@ def main():
             scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, args.epochs - epoch - 1))
 
         print(f"\nEpoch [{epoch+1}/{args.epochs}]  lr={optimizer.param_groups[0]['lr']:.6f}")
-        train_loss = train_one_epoch(model, train_loader, optimizer, device, scaler, criterion,
+        train_loss = train_one_epoch(model, train_loader,cls_head, optimizer, device, scaler, criterion,
                                      amp=args.amp, grad_clip=args.grad_clip)
 
-        # 验证（若不合并 train+val）
+        # 验证（若不合并 flowers_train_images+val）
         if val_loader is not None:
             val_acc, val_loss = evaluate(model, val_loader, device, amp=args.amp, desc="Val")
             print(f"Val  acc: {val_acc:.2f}%  loss: {val_loss:.4f}")
