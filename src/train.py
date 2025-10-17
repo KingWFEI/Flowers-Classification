@@ -153,7 +153,7 @@ def ce_with_snapmix(logits: torch.Tensor, target_pack, base_ce):
     return loss
 
 # 从预训练模型构建自己的模型
-def build_model(num_classes=102,use_fadc=False,pretrained=True):
+def build_model(num_classes=100,use_fadc=False,pretrained=True):
 
     if use_fadc:
         # FADCResNet50
@@ -274,7 +274,7 @@ def main():
     parser.add_argument("--label-smoothing", type=float, default=0.1)
     parser.add_argument("--grad-clip", type=float, default=None)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--output", type=str, default="./checkpoints_flowers102")
+    parser.add_argument("--output", type=str, default="./model")
     parser.add_argument("--freeze-epochs", type=int, default=0,
                         help="前若干轮只训练分类头（冷启动更稳）")
     parser.add_argument("--use-fadc", action="store_true", help="使用 FADC-ResNet50 架构（频域增强模块）")
@@ -297,7 +297,7 @@ def main():
     )
     print(f"Found {num_classes} classes: {class_names[:5]}{' ...' if len(class_names) > 5 else ''}")
 
-    model = build_model(num_classes=102,use_fadc=args.use_fadc, pretrained=True)
+    model = build_model(num_classes=100,use_fadc=args.use_fadc, pretrained=True)
     # 用 forward hook 抓取最后一个卷积特征图
     register_last_conv_hook(model)
 
