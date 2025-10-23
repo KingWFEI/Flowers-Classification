@@ -52,29 +52,6 @@ def build_eval_tf(img_size: int, mean: Tuple[float, float, float], std: Tuple[fl
         transforms.Normalize(mean, std),
     ])
 
-# # ======== Model：与训练保持一致 =========
-# def build_model(num_classes: int, use_fadc: bool = False, pretrained: bool = True):
-#     if use_fadc:
-#         # 你的 FADCResNet，与训练一致
-#         from model import FADCResNet
-#         model = FADCResNet(num_classes=num_classes)
-#         if pretrained:
-#             # 可选：把 torchvision resnet50 权重部分迁移（与训练时逻辑一致）
-#             tv = resnet50(weights=ResNet50_Weights.IMAGENET1K_V2)
-#             tv_state = tv.state_dict()
-#             msd = model.state_dict()
-#             for k, v in tv_state.items():
-#                 if k in msd and msd[k].shape == v.shape:
-#                     msd[k].copy_(v)
-#             model.load_state_dict(msd)
-#         return model
-#     else:
-#         weights = ResNet50_Weights.IMAGENET1K_V2 if pretrained else None
-#         model = resnet50(weights=weights)
-#         in_f = model.fc.in_features
-#         model.fc = nn.Linear(in_f, num_classes)
-#         return model
-
 
 def _strip_module_prefix(sd: dict):
     """去掉 DDP 的 'module.' 前缀"""
@@ -267,7 +244,7 @@ def main():
     ap.add_argument("--ckpt", type=str, required=True, help="训练保存的 best.pth / last.pth")
     ap.add_argument("--class-names", type=str, required=True, help="训练时保存的 class_names.json 路径")
     ap.add_argument("--image-dir", type=str, required=True, help="要预测的图片根目录（递归）")
-    ap.add_argument("--output", type=str, default="submission.csv")
+    ap.add_argument("--output", type=str, default="results/submission.csv")
     ap.add_argument("--img-size", type=int, default=288)
     ap.add_argument("--batch-size", type=int, default=64)
     ap.add_argument("--workers", type=int, default=0)
