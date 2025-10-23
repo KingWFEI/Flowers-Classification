@@ -1,128 +1,118 @@
-# ---------------- FADC 模块 ----------------
 import torch
-from torch import nn
+import torch.nn as nn
 import torch.nn.functional as F
-from torchvision.models import ResNet
+from torchvision.models.resnet import ResNet, Bottleneck
+from torchvision import models
 
+__all__ = [
+    "GeM", "ECA", "ECABottleneck", "ECAResNet50",
+    "build_model"
+]
 
-class FADCConv2d(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size=3, dilation=2, reduction=4, cutoff_ratio=0.2):
+# ---------- GeM ----------
+class GeM(nn.Module):
+    def __init__(self, p=3.0, eps=1e-6):
         super().__init__()
-        self.low_conv = nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size,
-                                  padding=kernel_size//2, bias=False)
-        self.high_conv = nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size,
-                                   padding=dilation, dilation=dilation, bias=False)
-        self.bn = nn.BatchNorm2d(out_channels)
-        self.act = nn.ReLU(inplace=True)
-        self.gate = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(out_channels, max(8, out_channels // reduction), 1, bias=False),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(max(8, out_channels // reduction), 2, 1, bias=True),
-            nn.Sigmoid()
-        )
-        self.cutoff_ratio = float(cutoff_ratio)
+        self.p = nn.Parameter(torch.ones(1) * float(p))
+        self.eps = float(eps)
 
     def forward(self, x):
-        orig_dtype = x.dtype
-        if x.dtype in [torch.float16, torch.bfloat16]:
-            x = x.float()
+        x = torch.clamp(x, min=self.eps).pow(self.p)
+        x = F.adaptive_avg_pool2d(x, 1).pow(1.0 / self.p)
+        return x
 
-        B, C, H, W = x.shape
-
-        if H < 8 or W < 8:
-            low_sp = self.low_conv(x)
-            high_sp = self.high_conv(x)
-        else:
-            Xf = torch.fft.rfft2(x, dim=(-2, -1))
-            _, _, Hf, Wf = Xf.shape
-
-            fy = torch.linspace(0, 0.5, steps=Hf, device=x.device)
-            fx = torch.linspace(0, 0.5, steps=Wf, device=x.device)
-            yy = fy[:, None].repeat(1, Wf)
-            xx = fx[None, :].repeat(Hf, 1)
-            rad = torch.sqrt(xx**2 + yy**2)
-            cutoff = self.cutoff_ratio * rad.max()
-
-            low_mask = (rad <= cutoff).to(x.dtype)[None, None, :, :]
-            Xf_low = Xf * low_mask
-            Xf_high = Xf * (1.0 - low_mask)
-
-            low_sp = torch.fft.irfft2(Xf_low, s=(H, W), dim=(-2, -1))
-            high_sp = torch.fft.irfft2(Xf_high, s=(H, W), dim=(-2, -1))
-
-            # 强制匹配尺寸
-            if low_sp.shape[-2:] != (H, W):
-                low_sp = F.interpolate(low_sp, size=(H, W), mode='bilinear', align_corners=False)
-            if high_sp.shape[-2:] != (H, W):
-                high_sp = F.interpolate(high_sp, size=(H, W), mode='bilinear', align_corners=False)
-
-            low_sp = self.low_conv(low_sp)
-            high_sp = self.high_conv(high_sp)
-
-        out_stack = torch.stack([low_sp, high_sp], dim=1)
-        gate_in = out_stack.sum(dim=1)
-        w = self.gate(gate_in).view(B, 2, 1, 1, 1)
-        fused = (out_stack * w).sum(dim=1)
-        fused = self.bn(fused)
-        fused = self.act(fused)
-
-        if orig_dtype in [torch.float16, torch.bfloat16]:
-            fused = fused.to(orig_dtype)
-        return fused
-
-# ---------------- FADC Bottleneck ----------------
-class FADCBottleneck(nn.Module):
-    expansion = 4
-
-    def __init__(self, inplanes, planes, stride=1, downsample=None,
-                 groups=1, base_width=64, dilation=1, norm_layer=None):
+# ---------- ECA ----------
+class ECA(nn.Module):
+    def __init__(self, channels: int, k_size: int = 3):
         super().__init__()
-        if norm_layer is None:
-            norm_layer = nn.BatchNorm2d
+        self.avg = nn.AdaptiveAvgPool2d(1)
+        self.conv = nn.Conv1d(1, 1, kernel_size=k_size, padding=(k_size - 1) // 2, bias=False)
+        self.act = nn.Sigmoid()
 
-        width = int(planes * (base_width / 64.)) * groups
+    def forward(self, x):
+        y = self.avg(x)                            # [B,C,1,1]
+        y = y.squeeze(-1).transpose(-1, -2)        # [B,1,C]
+        y = self.conv(y)
+        y = self.act(y.transpose(-1, -2).unsqueeze(-1))  # [B,C,1,1]
+        return x * y
 
-        self.conv1 = nn.Conv2d(inplanes, width, kernel_size=1, bias=False)
-        self.bn1 = norm_layer(width)
-        self.fadc = FADCConv2d(width, width, kernel_size=3, dilation=dilation)
-        self.conv3 = nn.Conv2d(width, planes * self.expansion, kernel_size=1, bias=False)
-        self.bn3 = norm_layer(planes * self.expansion)
-        self.relu = nn.ReLU(inplace=True)
-        self.stride = stride
-
-        # 如果 downsample 没提供，且通道/尺寸不匹配，则自动生成 1x1 下采样
-        if downsample is None and (stride != 1 or inplanes != planes * self.expansion):
-            self.downsample = nn.Sequential(
-                nn.Conv2d(inplanes, planes * self.expansion, kernel_size=1, stride=stride, bias=False),
-                norm_layer(planes * self.expansion)
-            )
-        else:
-            self.downsample = downsample
+# ---------- Bottleneck with ECA ----------
+class ECABottleneck(Bottleneck):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)  # conv1/bn1, conv2/bn2, conv3/bn3, downsample
+        self.eca = ECA(self.bn3.num_features, k_size=3)
 
     def forward(self, x):
         identity = x
 
-        out = self.conv1(x)
-        out = self.bn1(out)
-        out = self.relu(out)
+        out = self.conv1(x); out = self.bn1(out); out = self.relu(out)
+        out = self.conv2(out); out = self.bn2(out); out = self.relu(out)
+        out = self.conv3(out); out = self.bn3(out)
 
-        # 如果 stride > 1，需要对主分支下采样
-        if self.stride > 1:
-            out = F.interpolate(out, scale_factor=1/self.stride, mode='bilinear', align_corners=False)
-
-        out = self.fadc(out)
-
-        out = self.conv3(out)
-        out = self.bn3(out)
+        out = self.eca(out)
 
         if self.downsample is not None:
             identity = self.downsample(x)
-
         out += identity
         out = self.relu(out)
         return out
 
-class FADCResNet(ResNet):
-    def __init__(self, num_classes=102):
-        super().__init__(block=FADCBottleneck, layers=[3, 4, 6, 3], num_classes=num_classes)
+# ---------- ResNet50 + ECA + GeM + Dropout head ----------
+class ECAResNet50(ResNet):
+    def __init__(self, num_classes=100, dropout=0.2, use_gem=True):
+        super().__init__(block=ECABottleneck, layers=[3, 4, 6, 3], num_classes=num_classes)
+        if use_gem:
+            self.avgpool = GeM(p=3.0)  # 替换 GAP
+        in_f = self.fc.in_features
+        self.fc = nn.Sequential(
+            nn.Dropout(p=float(dropout)),
+            nn.Linear(in_f, num_classes)
+        )
+
+    @torch.no_grad()
+    def load_from_torchvision(self):
+        """把 torchvision 的 resnet50 预训练权重迁移到当前模型（除新增层外）。"""
+        try:
+            from torchvision.models import resnet50, ResNet50_Weights
+            tv = resnet50(weights=ResNet50_Weights.IMAGENET1K_V2)
+        except Exception:
+            tv = models.resnet50(pretrained=True)  # 兼容旧版 torchvision
+        tv_sd = tv.state_dict()
+        sd = self.state_dict()
+        matched = 0
+        for k, v in tv_sd.items():
+            if k in sd and sd[k].shape == v.shape:
+                sd[k].copy_(v); matched += 1
+        self.load_state_dict(sd, strict=False)
+        print(f"[ECAResNet50] Transferred {matched}/{len(sd)} tensors from torchvision resnet50.")
+        return self
+
+def build_model(
+        num_classes: int = 100,
+        backbone: str = "resnet50",
+        use_eca: bool = True,
+        use_gem: bool = True,
+        dropout: float = 0.2,
+        pretrained: bool = True
+) -> nn.Module:
+    """
+    构建模型：
+      - 默认：ResNet50 + ECA + GeM + Dropout
+      - 兼容纯 ResNet50（use_eca=False/use_gem=False）
+    """
+    if backbone.lower() != "resnet50":
+        raise ValueError("Only resnet50 backbone is supported in this reference implementation.")
+    if use_eca:
+        m = ECAResNet50(num_classes=num_classes, dropout=dropout, use_gem=use_gem)
+        if pretrained:
+            m.load_from_torchvision()
+        return m
+    else:
+        try:
+            from torchvision.models import resnet50, ResNet50_Weights
+            m = resnet50(weights=ResNet50_Weights.IMAGENET1K_V2 if pretrained else None)
+        except Exception:
+            m = models.resnet50(pretrained=pretrained)
+        in_f = m.fc.in_features
+        m.fc = nn.Sequential(nn.Dropout(float(dropout)), nn.Linear(in_f, num_classes))
+        return m

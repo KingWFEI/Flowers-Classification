@@ -30,4 +30,4 @@ python predict_folder.py \
   --std  0.24617702,0.22343232,0.25126648
 
 
-python src/predict.py --ckpt model/best.pth --class-names data/flowers_train_images/class_names.json --image-dir data/test_images --use-fadc
+python src/predict.py --ckpt model/best.pth --class-names data/flowers_train_images/class_names.json --image-dir data/test_dataset --use-fadc
