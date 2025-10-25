@@ -33,4 +33,4 @@ python predict_folder.py \
   --mean 0.45134348,0.46730715,0.32222468 \
   --std  0.24617702,0.22343232,0.25126648
 
-python train_test.py --data-root data --train-csv data/train_labels.csv --img-subdir train_images --epochs 80 --final-epochs 12 --img-size 224 --final-img-size 299 --batch-size 64 --amp --use-balanced-sampler --dataset-mean 0.45134347677230835,0.4673071503639221,0.3222246766090393 --dataset-std  0.24617701768875122,0.22343231737613678,0.2512664794921875 --use-snapmix --snapmix-alpha 5.0 --snapmix-prob 0.5 --freeze-epochs 2 --use-tta --output runs/exp_sota
+python train.py --data-root ../data/flowers_train_images --img-subdir train_images --train-csv ../data/flowers_train_images/train_labels.csv --epochs 80 --final-epochs 12 --img-size 224 --final-img-size 299 --batch-size 64 --amp --use-balanced-sampler --dataset-mean 0.45134347677230835,0.4673071503639221,0.3222246766090393 --dataset-std 0.24617701768875122,0.22343231737613678,0.2512664794921875 --use-snapmix --snapmix-alpha 5.0 --snapmix-prob 0.5 --freeze-epochs 2 --use-tta --output runs/exp_sota
