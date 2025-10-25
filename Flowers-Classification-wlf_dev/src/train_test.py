@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# train_test.py
+# train_test.py (with vis_metrics visualization)
 # CSV -> DataLoader, ResNet50(+ECA/GeM), Mixup/CutMix or SnapMix, EMA, 按 0.7/0.2/0.1 选最优
 import os
 import csv
@@ -28,10 +28,166 @@ from model import build_model  # noqa
 # 从你的 utils.py 使用 SnapMix & hook
 from utils import register_last_conv_hook, snapmix  # noqa
 
+# ------------------------------
+# 可视化（tool/vis_metrics.py）适配层
+# ------------------------------
+# 允许从 ./tool 导入 vis_metrics.py；若不存在则回退到内置可视化
+sys.path.append(os.path.join(os.path.dirname(__file__), "tools"))
+try:
+    import importlib
+    _vm = importlib.import_module("vis_metrics")  # 你项目中的可视化脚本
+    _VM_VISUALIZER_CLS = getattr(_vm, "Visualizer", None)
+except Exception as _e:
+    _vm = None
+    _VM_VISUALIZER_CLS = None
+
+
+def _ensure_dir(p: Path):
+    p.mkdir(parents=True, exist_ok=True)
+
+
+def _json_dumps(obj) -> str:
+    return json.dumps(obj, indent=2, ensure_ascii=False)
+
+
+class _FallbackViz:
+    """
+    当 tool/vis_metrics.py 不可用时使用的兜底可视化：
+    - 保存 history.json（原逻辑已做）
+    - 画 metrics 曲线到 metrics.png
+    - 画混淆矩阵到 cm_epochXX.png
+    """
+    def __init__(self, out_dir: str, class_names: Optional[List[str]] = None):
+        self.out_dir = Path(out_dir)
+        self.class_names = class_names or []
+        _ensure_dir(self.out_dir)
+
+    def _plot_history(self, history: List[Dict]):
+        if not history:
+            return
+        try:
+            import matplotlib.pyplot as plt
+            xs = [h["epoch"] for h in history]
+            tr_loss = [h["train_loss"] for h in history]
+            va_loss = [h["val_loss"] for h in history]
+            tr_acc  = [h["train_acc"] for h in history]
+            va_acc1 = [h["val_acc1"] for h in history]
+            va_f1   = [h["val_macro_f1"] for h in history]
+
+            # 损失
+            plt.figure()
+            plt.plot(xs, tr_loss, label="train_loss")
+            plt.plot(xs, va_loss, label="val_loss")
+            plt.xlabel("epoch")
+            plt.ylabel("loss")
+            plt.legend()
+            plt.tight_layout()
+            plt.savefig(self.out_dir / "metrics_loss.png")
+            plt.close()
+
+            # 准确率/F1
+            plt.figure()
+            plt.plot(xs, tr_acc, label="train_acc(%)")
+            plt.plot(xs, va_acc1, label="val_acc1(%)")
+            plt.plot(xs, va_f1, label="val_macro_f1(%)")
+            plt.xlabel("epoch")
+            plt.ylabel("metric(%)")
+            plt.legend()
+            plt.tight_layout()
+            plt.savefig(self.out_dir / "metrics_acc.png")
+            plt.close()
+        except Exception as e:
+            print(f"[vis:fallback] plot history failed: {e}")
+
+    def _plot_cm(self, cm_tensor: torch.Tensor, epoch: int):
+        try:
+            import matplotlib.pyplot as plt
+            import numpy as np
+            cm = cm_tensor.detach().cpu().numpy().astype(float)
+            cm_sum = cm.sum(axis=1, keepdims=True) + 1e-9
+            cm_norm = cm / cm_sum
+            plt.figure(figsize=(6, 5))
+            plt.imshow(cm_norm, interpolation='nearest')
+            plt.title(f"Confusion Matrix (epoch {epoch})")
+            plt.colorbar()
+            tick_marks = range(len(self.class_names)) if self.class_names else range(cm.shape[0])
+            plt.xticks(tick_marks, self.class_names if self.class_names else tick_marks, rotation=90)
+            plt.yticks(tick_marks, self.class_names if self.class_names else tick_marks)
+            # 文本
+            for i in range(cm.shape[0]):
+                for j in range(cm.shape[1]):
+                    val = cm_norm[i, j]
+                    if val > 0.001:
+                        plt.text(j, i, f"{val:.2f}", ha='center', va='center', fontsize=6)
+            plt.ylabel('True label')
+            plt.xlabel('Predicted label')
+            plt.tight_layout()
+            plt.savefig(self.out_dir / f"cm_epoch{epoch:03d}.png")
+            plt.close()
+        except Exception as e:
+            print(f"[vis:fallback] plot cm failed: {e}")
+
+    # 统一接口（和自定义 vis_metrics 可能不同，这里只需在训练时调用）
+    def log_epoch(self, record: Dict, cm: Optional[torch.Tensor] = None, history: Optional[List[Dict]] = None):
+        if history is not None:
+            self._plot_history(history)
+        if cm is not None:
+            self._plot_cm(cm, epoch=int(record.get("epoch", 0)))
+
+
+class _VMAdapter:
+    def __init__(self, out_dir: str, class_names: Optional[List[str]] = None):
+        self.out_dir = out_dir
+        self.class_names = class_names or []
+        self._fallback = _FallbackViz(out_dir=out_dir, class_names=self.class_names)
+        if _VM_VISUALIZER_CLS is not None:
+            try:
+                self._inst = _VM_VISUALIZER_CLS(out_dir=out_dir, class_names=self.class_names)
+                print("[vis] vis_metrics.Visualizer initialized.")
+            except Exception as e:
+                print(f"[vis] Visualizer init failed: {e}")
+                self._inst = None
+        else:
+            self._inst = None
+
+    def _call(self, name: str, *args, **kwargs) -> bool:
+        target = self._inst if self._inst is not None else _vm
+        if target is None:
+            return False
+        fn = getattr(target, name, None)
+        if callable(fn):
+            try:
+                fn(*args, **kwargs)
+                return True
+            except Exception as e:
+                print(f"[vis] call {name} failed: {e}")
+        return False
+
+    def log_epoch(self, record: Dict, cm: Optional[torch.Tensor] = None, history: Optional[List[Dict]] = None):
+        # 1) 首选标准接口
+        if self._call("log_epoch", record=record, cm=cm, history=history): return
+        if self._call("update", record=record, cm=cm, history=history): return
+        if self._call("add_record", record=record): pass
+
+        # 2) 兼容你的 tools：plot_curves + （如果有的话）plot_cm
+        ok = False
+        if history is not None:
+            ok = self._call("plot_curves", history=history, out_dir=self.out_dir) \
+                 or self._call("plot_history", history=history, out_dir=self.out_dir) \
+                 or self._call("save_curves", history=history, out_dir=self.out_dir)
+
+        if cm is not None:
+            ok = self._call("plot_cm", cm=cm, classes=self.class_names, out_dir=self.out_dir) or ok
+
+        # 3) 仍然没画？回退内置可视化
+        if not ok:
+            self._fallback.log_epoch(record=record, cm=cm, history=history)
+
 
 # ------------------------------
 # Utils
 # ------------------------------
+
 def set_seed(seed: int = 42):
     random.seed(seed)
     torch.manual_seed(seed)
@@ -197,6 +353,7 @@ def filter_broken(rows: List[Dict], img_dir: Path) -> List[Dict]:
 # ------------------------------
 # Augmentations
 # ------------------------------
+
 def build_transforms(img_size: int, train: bool, lite: bool = False,
                      mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)):
     tf = []
@@ -224,6 +381,7 @@ def build_transforms(img_size: int, train: bool, lite: bool = False,
 # ------------------------------
 # Mixup/CutMix helpers（保留，用于非 SnapMix 模式）
 # ------------------------------
+
 def apply_mixup(images, targets, alpha=0.2):
     if alpha <= 0:
         return images, None, None
@@ -315,7 +473,8 @@ def tta_logits(model, images, amp=False):
 
 
 @torch.no_grad()
-def evaluate(model, loader, device, amp=False, use_tta=False, desc="Eval", num_classes: int = 100):
+def evaluate(model, loader, device, amp=False, use_tta=False, desc="Eval", num_classes: int = 100,
+            return_cm: bool = False):
     model.eval()
     total, loss_sum = 0, 0.0
     correct1, correct5 = 0, 0
@@ -359,12 +518,16 @@ def evaluate(model, loader, device, amp=False, use_tta=False, desc="Eval", num_c
     acc1 = 100.0 * correct1 / max(1, total)
     acc5 = 100.0 * correct5 / max(1, total)
     avg_loss = loss_sum / max(1, total)
+
+    if return_cm:
+        return acc1, acc5, macro_f1, avg_loss, cm
     return acc1, acc5, macro_f1, avg_loss
 
 
 # ------------------------------
 # Train one epoch
 # ------------------------------
+
 def train_one_epoch(model, loader, optimizer, device, scaler, criterion, epoch, total_epochs,
                     amp=False, grad_clip=None, mixup_alpha=0.2, cutmix_alpha=1.0, ema: Optional[ModelEMA] = None,
                     use_snapmix=False, snapmix_alpha=5.0, snapmix_prob=0.5, cls_head: Optional[nn.Module]=None):
@@ -438,6 +601,7 @@ def train_one_epoch(model, loader, optimizer, device, scaler, criterion, epoch, 
 # ------------------------------
 # Checkpoint helpers
 # ------------------------------
+
 def save_checkpoint(state, out_dir: str, is_best=False, filename="last.pth"):
     Path(out_dir).mkdir(parents=True, exist_ok=True)
     torch.save(state, os.path.join(out_dir, filename))
@@ -448,6 +612,7 @@ def save_checkpoint(state, out_dir: str, is_best=False, filename="last.pth"):
 # ------------------------------
 # Main
 # ------------------------------
+
 def main():
     parser = argparse.ArgumentParser(description="Flower Classification (ResNet50 + ECA/GeM + SnapMix 可选)")
     parser.add_argument("--data-root", type=str, required=True, help="数据根目录（包含图像子目录）")
@@ -482,6 +647,9 @@ def main():
     parser.add_argument("--use-snapmix", action="store_true", help="使用 SnapMix（需要 utils.register_last_conv_hook）")
     parser.add_argument("--snapmix-alpha", type=float, default=5.0, help="SnapMix 的 Beta 分布超参")
     parser.add_argument("--snapmix-prob",  type=float, default=0.5, help="每个 batch 启用 SnapMix 的概率")
+    # 可视化开关
+    parser.add_argument("--no-vis", action="store_true", help="禁用 vis_metrics 可视化输出")
+
     args = parser.parse_args()
 
     set_seed(args.seed)
@@ -540,13 +708,13 @@ def main():
         pretrained=True
     )
 
-    # DP（可选）
+    # DP
     if torch.cuda.device_count() > 1:
         print(f"Using DataParallel with {torch.cuda.device_count()} GPUs")
         model = nn.DataParallel(model)
     model = model.to(device)
 
-    # ✅ SnapMix 需要提前注册最后卷积层的 hook —— 对“当前这个 model 对象”注册即可
+    # SnapMix 需要提前注册最后卷积层的 hook —— 对“当前这个 model 对象”注册即可
     if args.use_snapmix:
         register_last_conv_hook(model)
 
@@ -599,10 +767,21 @@ def main():
         print(f"Resumed from {args.resume}, start at epoch {start_epoch}")
 
     out_dir = Path(args.output)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    _ensure_dir(out_dir)
     history: List[Dict] = []
 
-    # ✅ 找到“最后一个 nn.Linear”作为 SnapMix 的分类头（兼容 Sequential 头）
+    # 可视化实例：优先使用项目内 vis_metrics，否则使用兜底
+    if args.no_vis:
+        vis = None
+        print("[vis] disabled by --no-vis")
+    else:
+        if _vm is not None:
+            vis = _VMAdapter(out_dir=str(out_dir), class_names=class_names)
+        else:
+            vis = _FallbackViz(out_dir=str(out_dir), class_names=class_names)
+            print("[vis] vis_metrics not found, using fallback visualizer.")
+
+    # 找到“最后一个 nn.Linear”作为 SnapMix 的分类头（兼容 Sequential 头）
     def get_last_linear(m: nn.Module) -> nn.Linear:
         core = m.module if isinstance(m, nn.DataParallel) else m
         last = None
@@ -646,9 +825,11 @@ def main():
 
         # 验证（EMA 优先）
         eval_model = ema.ema if ema is not None else model
-        val_acc1, val_acc5, val_f1, val_loss = evaluate(
-            eval_model, val_loader, device, amp=args.amp, use_tta=args.use_tta, desc="Val", num_classes=num_classes
+        val_out = evaluate(
+            eval_model, val_loader, device, amp=args.amp, use_tta=args.use_tta,
+            desc="Val", num_classes=num_classes, return_cm=True
         )
+        val_acc1, val_acc5, val_f1, val_loss, cm = val_out
 
         score = 0.7 * val_acc1 + 0.2 * val_acc5 + 0.1 * val_f1
         is_best = score > best_score
@@ -676,6 +857,13 @@ def main():
         history.append(rec)
         with open(out_dir / "history.json", "w", encoding="utf-8") as f:
             f.write(json_dumps(history))
+
+        # 可视化：每个 epoch 结束后更新曲线与混淆矩阵
+        if not args.no_vis and vis is not None:
+            try:
+                vis.log_epoch(record=rec, cm=cm, history=history)
+            except Exception as e:
+                print(f"[vis] log_epoch failed: {e}")
 
         print(f"[Epoch {epoch}] "
               f"train_acc={train_acc:.2f}  val_acc1={val_acc1:.2f}  val_acc5={val_acc5:.2f}  "
@@ -714,15 +902,16 @@ def main():
                 use_snapmix=args.use_snapmix, snapmix_alpha=max(1.0, args.snapmix_alpha * 0.5),
                 snapmix_prob=max(0.1, args.snapmix_prob * 0.5), cls_head=cls_head
             )
-            eval_model = ema.ema if ema is not None else model
-            val_acc1, val_acc5, val_f1, val_loss = evaluate(
-                eval_model, val_loader, device, amp=args.amp, use_tta=args.use_tta, desc="Val(hires)", num_classes=num_classes
+            val_out = evaluate(
+                ema.ema if ema is not None else model, val_loader, device, amp=args.amp, use_tta=args.use_tta,
+                desc="Val(hires)", num_classes=num_classes, return_cm=True
             )
+            val_acc1, val_acc5, val_f1, val_loss, cm = val_out
             score = 0.7 * val_acc1 + 0.2 * val_acc5 + 0.1 * val_f1
             is_best = score > best_score
             if is_best:
                 best_score = score
-            save_checkpoint({"epoch": epoch, "state_dict": eval_model.state_dict()}, str(out_dir), is_best=is_best)
+            save_checkpoint({"epoch": epoch, "state_dict": (ema.ema if ema is not None else model).state_dict()}, str(out_dir), is_best=is_best)
             save_checkpoint({"epoch": epoch, "state_dict": model.state_dict()}, str(out_dir), is_best=False, filename="last_raw.pth")
 
             rec = {
@@ -739,6 +928,13 @@ def main():
             history.append(rec)
             with open(out_dir / "history.json", "w", encoding="utf-8") as f:
                 f.write(json_dumps(history))
+
+            if not args.no_vis and vis is not None:
+                try:
+                    vis.log_epoch(record=rec, cm=cm, history=history)
+                except Exception as e:
+                    print(f"[vis] log_epoch(hires) failed: {e}")
+
             print(f"[HiRes Epoch {k}/{args.final_epochs}] "
                   f"val_acc1={val_acc1:.2f} val_acc5={val_acc5:.2f} val_macro_f1={val_f1:.2f} score={score:.3f} best={best_score:.3f}")
 
