@@ -1,17 +1,8 @@
-# Flowers-Classification
-Flowers-Classification
 
 
-# 建议新环境
-pip install "torch>=2.1" "torchvision>=0.16" "tqdm>=4.65"
+# 运行
+python train_timm_efficientv2.py --data-root "/home/featurize/efficientnetv2/datasets" --train-csv "/home/featurize/efficientnetv2/datasets/train_labels.csv" --img-subdir "train" --epochs 80 --final-epochs 12 --img-size 224 --final-img-size 299 --batch-size 64 --amp --freeze-epochs 2 --use-balanced-sampler --use-tta --output "runs/efv2s_flowers"
 
-# 切换 BiT / ViT 等 timm 模型
-pip install "timm>=1.0.7"
-
-# 运行（默认 50 轮、224 分辨率、AMP）
-python code/train_flowers102.py --data data/flowers/flowers --timm-model resnetv2_50x1_bit.goog_in21k  --amp --epochs 50 --batch-size 64 --amp
-# 不使用timm 直接使用resnet
-python code/train_flowers102.py --data data/flowers/flowers   --amp --epochs 50 --batch-size 64 --amp
 
 # 预测脚本
-python predict.py --ckpt ./checkpoints_flowers102/best.pth --class-names ./data/flowers/flowers/class_names.json --image-dir ./inference_images --output preds.csv --img-size 288 --batch-size 64 --workers 0 --topk 5
+python predict.py --ckpt /home/featurize/efficientnetv2/runs/efv2s_flowers/best.pth --train-dir /home/featurize/efficientnetv2/datasets/train --train-csv /home/featurize/efficientnetv2/datasets/train_labels.csv --n 200 --model tf_efficientnetv2_s --img-size 299 --batch-size 64 --mean 0.485,0.456,0.406 --std  0.229,0.224,0.225 --save-csv results/random200_preds.csv
